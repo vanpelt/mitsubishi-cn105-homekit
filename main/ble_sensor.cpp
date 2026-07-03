@@ -204,13 +204,88 @@ static bool decodeBTHome(const uint8_t* svc, uint8_t len, SensorReading& out) {
     return gotTemp;
 }
 
+// SwitchBot Meter family — proprietary format, readings split across AD fields.
+// Every meter model mirrors the same 3-byte temp+hum block into its 0x0969
+// manufacturer data; the 0xFD3D service data carries the device type and
+// battery (Meter/Meter Plus repeat the temp block there too). The manufacturer
+// field has no type byte of its own and company ID 0x0969 is shared by every
+// SwitchBot product (Bot, Curtain, ... with unrelated bytes at the same
+// offsets), so decoding it is gated on a meter-type 0xFD3D field in the same
+// advertisement. Each decoder fills what its field provides and the callers
+// merge NAN-aware.
+
+static bool isSwitchBotMeter(uint8_t devType) {
+    return devType == 'T' ||   // Meter
+           devType == 'i' ||   // Meter Plus
+           devType == '4' ||   // Meter Pro
+           devType == '5' ||   // Meter Pro CO2
+           devType == 'w';     // Indoor/Outdoor Meter
+}
+
+// Pre-scan the AD fields for a SwitchBot 0xFD3D service-data field and return
+// its device type byte (0 if absent) — the 0x0969 manufacturer decoder needs
+// it to tell meters apart from other SwitchBot products
+static uint8_t switchBotType(const uint8_t* adv, size_t totalLen) {
+    uint8_t i = 0;
+    while (i + 1 < totalLen) {
+        uint8_t fieldLen = adv[i];
+        if (fieldLen == 0 || i + fieldLen >= totalLen) break;
+        if (adv[i + 1] == 0x16 && fieldLen >= 4) {
+            uint16_t uuid = adv[i + 2] | (adv[i + 3] << 8);
+            if (uuid == 0xFD3D) return adv[i + 4] & 0x7F;  // bit7 flags "new data"
+        }
+        i += fieldLen + 1;
+    }
+    return 0;
+}
+
+// Shared 3-byte temp+hum block: [0] low nibble = tenths of °C (high nibble =
+// alert flags, masked off per the official format docs), [1] bits 0-6 =
+// integer °C with bit7 set meaning positive, [2] bits 0-6 = humidity %.
+// Integer range checks before any float math — this runs in the scan callback
+// and the C3/C6 targets have no FPU.
+static bool decodeSwitchBotTempHum(const uint8_t* d, SensorReading& out) {
+    int frac    = d[0] & 0x0F;
+    int tempInt = d[1] & 0x7F;
+    int hum     = d[2] & 0x7F;
+    bool positive = (d[1] & 0x80) != 0;
+    int tenths  = tempInt * 10 + frac;                     // |temp| in 0.1°C
+    if (frac > 9 || hum > 100 || tenths > (positive ? 800 : 400))
+        return false;                                      // mirrors validTemp/validHum
+    out.temp = positive ? (float)tenths / 10.0f : -(float)tenths / 10.0f;
+    out.hum  = (float)hum;
+    return true;
+}
+
+// Manufacturer data 0x0969, including the 2-byte company ID: temp+hum block at
+// [10-12]. Only called once the 0xFD3D field confirmed a meter device type
+static bool decodeSwitchBotMfr(const uint8_t* mfr, uint8_t len, SensorReading& out) {
+    if (len < 13) return false;
+    return decodeSwitchBotTempHum(mfr + 10, out);
+}
+
+// Service data UUID 0xFD3D, after the 2-byte UUID: [0]=device type,
+// [2]=battery, temp+hum block at [3-5] on Meter/Meter Plus
+static bool decodeSwitchBotSvc(const uint8_t* svc, uint8_t len, SensorReading& out) {
+    if (len < 3) return false;
+    uint8_t devType = svc[0] & 0x7F;
+    if (!isSwitchBotMeter(devType)) return false;   // Bot, Curtain, ...
+    bool gotData = false;
+    if ((devType == 'T' || devType == 'i') && len >= 6)
+        gotData = decodeSwitchBotTempHum(svc + 3, out);
+    int8_t batt = (int8_t)(svc[2] & 0x7F);
+    if (validBatt(batt)) { out.batt = batt; gotData = true; }
+    return gotData;   // false when the frame yielded nothing usable
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Decoder dispatch — try all decoders for a single AD field
 // ══════════════════════════════════════════════════════════════════════════════
 
 struct DecodeResult { bool decoded; const char* type; };
 
-static DecodeResult tryDecode(uint8_t fieldType, const uint8_t* data, uint8_t len, SensorReading& out) {
+static DecodeResult tryDecode(uint8_t fieldType, const uint8_t* data, uint8_t len,
+                              uint8_t sbType, SensorReading& out) {
     if (fieldType == 0xFF && len >= 2) {
         uint16_t cid = data[0] | (data[1] << 8);
         if (cid == 0xEC88) {
@@ -221,6 +296,9 @@ static DecodeResult tryDecode(uint8_t fieldType, const uint8_t* data, uint8_t le
         }
         if (cid == 0x0001 && len >= 8 && decodeGoveeV1(data, len, out))
             return {true, "Govee V1"};
+        if (cid == 0x0969 && len >= 13 && isSwitchBotMeter(sbType) &&
+            decodeSwitchBotMfr(data, len, out))
+            return {true, "SwitchBot"};
     }
     if (fieldType == 0x16 && len >= 2) {
         uint16_t uuid = data[0] | (data[1] << 8);
@@ -228,6 +306,8 @@ static DecodeResult tryDecode(uint8_t fieldType, const uint8_t* data, uint8_t le
             return {true, "PVVX"};
         if (uuid == 0xFCD2 && decodeBTHome(data + 2, len - 2, out))
             return {true, "BTHome v2"};
+        if (uuid == 0xFD3D && decodeSwitchBotSvc(data + 2, len - 2, out))
+            return {true, "SwitchBot"};
     }
     return {false, nullptr};
 }
@@ -242,11 +322,12 @@ static DecodeResult tryDecode(uint8_t fieldType, const uint8_t* data, uint8_t le
 // counts as a recognised sensor.
 static const char* decodeAdvertisement(const uint8_t* adv, size_t totalLen, SensorReading& out) {
     const char* type = nullptr;
+    const uint8_t sbType = switchBotType(adv, totalLen);
     uint8_t i = 0;
     while (i + 1 < totalLen) {
         uint8_t fieldLen = adv[i];
         if (fieldLen == 0 || i + fieldLen >= totalLen) break;
-        DecodeResult r = tryDecode(adv[i + 1], &adv[i + 2], fieldLen - 1, out);
+        DecodeResult r = tryDecode(adv[i + 1], &adv[i + 2], fieldLen - 1, sbType, out);
         if (r.decoded) type = r.type;
         i += fieldLen + 1;
     }
@@ -274,7 +355,9 @@ static void addDiscoveryResult(const char* addrLower, const char* name,
         }
     }
 
-    // Add new entry
+    // Add new entry — only once a temperature has decoded; a split-field
+    // sensor's battery-only frame has no reading to identify the device by
+    if (std::isnan(temp)) return;
     if (s_discoveryCount < BLE_MAX_DISCOVERED) {
         auto& d = s_discovered[s_discoveryCount];
         snprintf(d.addr, sizeof(d.addr), "%s", addr);
@@ -344,13 +427,18 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         const char* liveType = decodeAdvertisement(disc->data, disc->length_data, reading);
         if (liveType) {
             taskENTER_CRITICAL(&s_mux);
-            if (!std::isnan(reading.temp)) s_temperature = reading.temp;
-            if (!std::isnan(reading.hum))  s_humidity    = reading.hum;
-            if (reading.batt >= 0)         s_battery     = reading.batt;
-            s_sensorType    = liveType;
-            s_rssi          = disc->rssi;
-            s_lastUpdate    = uptime_ms();
-            s_staleReverted = false;
+            if (!std::isnan(reading.temp)) {
+                s_temperature   = reading.temp;
+                // Freshness follows the temperature: battery-only frames from
+                // split-field sensors (SwitchBot Pro family) must not keep the
+                // stale-revert watchdog from firing
+                s_lastUpdate    = uptime_ms();
+                s_staleReverted = false;
+            }
+            if (!std::isnan(reading.hum))  s_humidity = reading.hum;
+            if (reading.batt >= 0)         s_battery  = reading.batt;
+            s_sensorType = liveType;
+            s_rssi       = disc->rssi;
             taskEXIT_CRITICAL(&s_mux);
 
             if (!s_typeLogged) {
