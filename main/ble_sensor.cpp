@@ -239,6 +239,52 @@ static uint8_t switchBotType(const uint8_t* adv, size_t totalLen) {
     return 0;
 }
 
+// SwitchBot splits a meter's data across two BLE PDUs: the primary ADV_IND
+// carries the 0xFD3D service data (device type + battery) and the SCAN_RSP
+// carries the 0x0969 manufacturer data (temperature + humidity). NimBLE hands
+// these to us as two separate BLE_GAP_EVENT_DISC callbacks, each with its own
+// buffer — so switchBotType() returns 0 for the scan-response buffer and the
+// 0x0969 temp decoder (gated on the meter type) would never fire. Cache the
+// last meter type seen per MAC so the gate carries across the adv/scan-rsp pair.
+// Only touched from the NimBLE host task (the scan callback), so no locking.
+struct SbTypeCacheEntry { char mac[18]; uint8_t type; uint32_t seen; };
+static SbTypeCacheEntry s_sbTypeCache[BLE_MAX_DISCOVERED];
+static int s_sbTypeCacheCount = 0;
+
+static uint8_t resolveSwitchBotType(const uint8_t* adv, size_t totalLen, const char* mac) {
+    uint8_t t = switchBotType(adv, totalLen);
+    if (mac == nullptr) return t;
+
+    if (t != 0) {                                    // 0xFD3D present — cache it
+        for (int i = 0; i < s_sbTypeCacheCount; i++) {
+            if (strcasecmp(s_sbTypeCache[i].mac, mac) == 0) {
+                s_sbTypeCache[i].type = t;
+                s_sbTypeCache[i].seen = uptime_ms();
+                return t;
+            }
+        }
+        int slot;
+        if (s_sbTypeCacheCount < (int)BLE_MAX_DISCOVERED) {
+            slot = s_sbTypeCacheCount++;
+        } else {                                     // evict least-recently-seen
+            slot = 0;
+            for (int i = 1; i < s_sbTypeCacheCount; i++)
+                if (s_sbTypeCache[i].seen < s_sbTypeCache[slot].seen) slot = i;
+        }
+        strncpy(s_sbTypeCache[slot].mac, mac, sizeof(s_sbTypeCache[slot].mac) - 1);
+        s_sbTypeCache[slot].mac[sizeof(s_sbTypeCache[slot].mac) - 1] = '\0';
+        s_sbTypeCache[slot].type = t;
+        s_sbTypeCache[slot].seen = uptime_ms();
+        return t;
+    }
+
+    // No 0xFD3D in this buffer (the scan response) — reuse the cached meter type
+    for (int i = 0; i < s_sbTypeCacheCount; i++)
+        if (strcasecmp(s_sbTypeCache[i].mac, mac) == 0)
+            return s_sbTypeCache[i].type;
+    return 0;
+}
+
 // Shared 3-byte temp+hum block: [0] low nibble = tenths of °C (high nibble =
 // alert flags, masked off per the official format docs), [1] bits 0-6 =
 // integer °C with bit7 set meaning positive, [2] bits 0-6 = humidity %.
@@ -320,9 +366,10 @@ static DecodeResult tryDecode(uint8_t fieldType, const uint8_t* data, uint8_t le
 // sensor type (string literal), or nullptr if no known sensor matched. Used by
 // both the live feed and discovery, so the two paths can never disagree on what
 // counts as a recognised sensor.
-static const char* decodeAdvertisement(const uint8_t* adv, size_t totalLen, SensorReading& out) {
+static const char* decodeAdvertisement(const uint8_t* adv, size_t totalLen,
+                                       const char* mac, SensorReading& out) {
     const char* type = nullptr;
-    const uint8_t sbType = switchBotType(adv, totalLen);
+    const uint8_t sbType = resolveSwitchBotType(adv, totalLen, mac);
     uint8_t i = 0;
     while (i + 1 < totalLen) {
         uint8_t fieldLen = adv[i];
@@ -410,7 +457,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         // the user can confirm the right device by its temperature/humidity
         if (s_discoveryMode) {
             SensorReading r;
-            const char* type = decodeAdvertisement(disc->data, disc->length_data, r);
+            const char* type = decodeAdvertisement(disc->data, disc->length_data, addrStr, r);
             if (type) {
                 char name[24];
                 extractDeviceName(disc->data, disc->length_data, name, sizeof(name));
@@ -424,7 +471,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
 
         // Decode the live advertisement and publish the freshest reading
         SensorReading reading;
-        const char* liveType = decodeAdvertisement(disc->data, disc->length_data, reading);
+        const char* liveType = decodeAdvertisement(disc->data, disc->length_data, addrStr, reading);
         if (liveType) {
             taskENTER_CRITICAL(&s_mux);
             if (!std::isnan(reading.temp)) {
