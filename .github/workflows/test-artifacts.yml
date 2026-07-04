@@ -1,0 +1,39 @@
+# Temporary fork-only workflow: build the NanoC6 image for hardware testing of
+# the SwitchBot decoder branch and upload it as a downloadable artifact.
+name: Test Artifacts
+
+on:
+  push:
+    branches: [ci-artifacts]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Build (nanoc6)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5
+          target: esp32c6
+          command: |
+            idf.py set-target esp32c6
+            idf.py build
+
+      - name: Collect
+        run: |
+          mkdir -p artifact/nanoc6
+          sudo cp build/bootloader/bootloader.bin        artifact/nanoc6/bootloader.bin
+          sudo cp build/partition_table/partition-table.bin artifact/nanoc6/partitions.bin
+          sudo cp build/ota_data_initial.bin             artifact/nanoc6/boot_app0.bin
+          sudo cp build/mitsubishi-cn105-homekit.bin     artifact/nanoc6/firmware.bin
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: nanoc6-switchbot-test
+          path: artifact
